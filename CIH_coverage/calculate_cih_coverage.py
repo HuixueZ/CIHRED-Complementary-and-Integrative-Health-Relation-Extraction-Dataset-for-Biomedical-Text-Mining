@@ -3,149 +3,227 @@
 """
 calculate_cih_coverage.py
 =========================
-Compute CIH (Complementary and Integrative Health) lexicon coverage over
-biomedical NER datasets: BC5CDR (PubTator .txt) and BioRED / any BioC-JSON file.
+Compute CIH lexicon coverage over biomedical NER datasets.
+Reproduces Table 4 from the paper:
 
-Supported datasets
+  Dataset | Total Docs | Docs with CIH | Covered CIH Concepts | Concept Coverage % | Unique Annotation Terms | Annotated CIH Terms
+
+Column definitions
 ------------------
-  - BC5CDR  : PubTator flat-text format (.txt)
-  - BioRED  : BioC-JSON format (.json)
-  - DocRED-Bio / other BioC-JSON datasets
+  Total Docs              : number of unique documents across all splits
+  Docs with CIH           : documents where ≥1 CIH-type annotation matched a CIH concept
+  Covered CIH Concepts    : distinct CIH concept names hit by matched annotation terms
+  Concept Coverage %      : Covered CIH Concepts / total CIH concepts × 100
+  Unique Annotation Terms : unique CIH-type annotation spans (Energy/Manual/Mindbody/
+                            CIH_intervention/Usual_Medical_Care) pooled across splits
+  Annotated CIH Terms     : those spans matched to a CIH concept via fuzzy matching
 
-Coverage metrics computed
--------------------------
-  1. Free-text coverage   – how many documents contain ≥1 CIH variant mention
-  2. Concept coverage     – how many CIH concepts are hit across the corpus
-  3. NER term coverage    – what fraction of gold-annotated entity spans map to
-                            a CIH concept (fuzzy / hybrid matching)
+Methodology (from calculate_coverage2.py)
+------------------------------------------
+  - Only CIH entity types are matched (not Chemical / Disease / Gene / Outcome_marker).
+  - Matching uses difflib.get_close_matches per entity category (cutoff=0.86).
+  - Normalization: lowercase, collapse whitespace, remove punct except - + /
+  - Concept coverage counts distinct concept names hit (not lexicon variant strings).
+  - All splits pooled before matching → one row per dataset.
 
-Usage
------
-  See README.md or run:  python calculate_cih_coverage.py --help
+Supported input formats
+-----------------------
+  .txt  : BC5CDR PubTator  (entity types: Chemical, Disease)
+  .json : BioC-JSON        (BioRED: passages/annotations)
+          CIHRED           (sentence list with top-level entities + doc_id)
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import difflib
 import json
 import os
 import re
-import sys
-from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Tuple
-
-# ---------------------------------------------------------------------------
-# Optional: rapidfuzz gives faster fuzzy matching; fall back to difflib
-# ---------------------------------------------------------------------------
-try:
-    from rapidfuzz import fuzz as _fuzz
-    _HAS_RAPIDFUZZ = True
-except ImportError:
-    _HAS_RAPIDFUZZ = False
-    import difflib
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Tuple
 
 
 # ===========================================================================
-# 1.  TEXT NORMALISATION
+# 1.  CIH ENTITY TYPES TO MATCH AGAINST THE LEXICON
+#     (all other types — Chemical, Disease, Gene, Outcome_marker — are skipped)
 # ===========================================================================
 
-_RE_PUNCT = re.compile(r"[^\w\s]+", re.UNICODE)
-_RE_WS    = re.compile(r"\s+")
-
-
-def normalize(text: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace."""
-    text = text.lower().strip()
-    text = _RE_PUNCT.sub(" ", text)
-    text = _RE_WS.sub(" ", text)
-    return text.strip()
+CIH_ENTITY_TYPES = {
+    "Energy_therapy",
+    "Energy_therapies",
+    "Manual_bodybased_therapy",
+    "Manual_bodybased_therapies",
+    "Mindbody_therapy",
+    "Mindbody_therapies",
+    "CIH_intervention",
+    "CAM_therapies",
+    "Usual_Medical_Care",
+}
 
 
 # ===========================================================================
-# 2.  DATASET LOADERS
+# 2.  NORMALISATION  (from calculate_coverage2.py)
 # ===========================================================================
 
-DocRecord = Dict  # {pmid, title, abstract, text, entities: [(term, type)]}
+def _norm(s: str) -> str:
+    """Lowercase, collapse whitespace, remove punct except - + /"""
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s\-+/]", "", s)
+    return s
 
 
-def load_bc5cdr(path: str) -> List[DocRecord]:
+# ===========================================================================
+# 3.  CIH LEXICON LOADER  →  {concept_name: [norm_variant, ...]}
+# ===========================================================================
+
+def load_cih_mapping(path: str) -> Dict[str, List[str]]:
     """
-    Load a BC5CDR PubTator file (blocks separated by blank lines).
-    Entity types retained: Chemical, Disease.
+    Load CIH lexicon JSON and return {concept: [normalised_variant, ...]}.
+
+    Accepts the nested format from 2023cihlex_manual_filter_mapping.json:
+      { category: { variant_key: { "term": "..." } } }
+    and the flat format:
+      { concept: ["variant", ...] }
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        content = fh.read().strip()
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
 
-    docs: List[DocRecord] = []
-    for block in content.split("\n\n"):
-        block = block.strip()
-        if not block:
-            continue
-        pmid = title = abstract = ""
-        entities: List[Tuple[str, str]] = []
-        for line in block.splitlines():
-            if "|t|" in line:
-                pmid, title = line.split("|t|", 1)
-                pmid = pmid.strip(); title = title.strip()
-            elif "|a|" in line:
-                parts = line.split("|a|", 1)
-                pmid = pmid or parts[0].strip()
-                abstract = parts[1].strip()
-            elif "\t" in line and "|t|" not in line and "|a|" not in line:
-                cols = line.split("\t")
-                if len(cols) >= 6 and cols[4] in ("Chemical", "Disease"):
-                    entities.append((cols[3], cols[4]))
-        if pmid:
-            docs.append({
-                "pmid": pmid,
-                "title": title,
-                "abstract": abstract,
-                "text": f"{title} {abstract}".strip(),
-                "entities": entities,
-            })
-    return docs
+    mapping: Dict[str, List[str]] = {}
+    for concept, variants in raw.items():
+        if isinstance(variants, dict):
+            variant_set: Set[str] = set()
+            for vk, vv in variants.items():
+                if isinstance(vv, dict) and isinstance(vv.get("term"), str):
+                    t = vv["term"].strip()
+                    if t:
+                        variant_set.add(_norm(t))
+                elif isinstance(vk, str) and vk.strip():
+                    variant_set.add(_norm(vk))
+            if variant_set:
+                mapping[concept] = sorted(variant_set)
+        elif isinstance(variants, list):
+            vs = [_norm(v) for v in variants if isinstance(v, str) and v.strip()]
+            if vs:
+                mapping[concept] = sorted(set(vs))
+    return mapping
 
 
-def load_bioc_json(path: str) -> List[DocRecord]:
+# ===========================================================================
+# 4.  DATASET LOADERS
+#     Each loader returns:
+#       doc_terms : {doc_id: set(lowercased CIH-type annotation spans)}
+#       all_entities: list of {text, type, doc_id}  ← for per-category matching
+# ===========================================================================
+
+def _make_record(doc_id: str, text: str, etype: str) -> dict:
+    return {"doc_id": doc_id, "text": _norm(text), "type": etype}
+
+
+def load_bc5cdr(path: str) -> Tuple[Dict[str, Set[str]], List[dict], Dict[str, str]]:
     """
-    Load a BioC-style JSON file (BioRED, DocRED-Bio, etc.).
-    Entity type is read from annotation infons['type'].
+    BC5CDR PubTator format.
+    Returns doc_terms, entities, and doc_texts {doc_id: full_text_lowercased}.
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
+    doc_terms: Dict[str, Set[str]] = {}
+    doc_texts: Dict[str, str] = {}
+    entities: List[dict] = []
 
-    docs: List[DocRecord] = []
-    for doc in data.get("documents", []):
-        doc_id = str(doc.get("id", "")).strip()
-        passages = doc.get("passages", []) or []
-        text_parts: List[str] = []
-        entities: List[Tuple[str, str]] = []
-
-        for passage in passages:
-            ptxt = passage.get("text", "")
-            if ptxt:
-                text_parts.append(ptxt)
-            for ann in passage.get("annotations", []) or []:
-                term = ann.get("text", "")
-                infons = ann.get("infons", {}) or {}
-                etype = str(infons.get("type", "")).strip() if isinstance(infons, dict) else ""
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "|t|" in line or "|a|" in line:
+                parts = line.split("|", 2)
+                pmid  = parts[0].strip()
+                text  = parts[2].strip() if len(parts) > 2 else ""
+                doc_terms.setdefault(pmid, set())
+                doc_texts[pmid] = doc_texts.get(pmid, "") + " " + text.lower()
+                continue
+            if "\t" not in line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 5:
+                pmid  = parts[0].strip()
+                term  = parts[3].strip()
+                etype = parts[4].strip()
+                doc_terms.setdefault(pmid, set())
                 if term:
-                    entities.append((term, etype))
-
-        if doc_id:
-            docs.append({
-                "pmid": doc_id,
-                "title": "",
-                "abstract": "",
-                "text": " ".join(text_parts).strip(),
-                "entities": entities,
-            })
-    return docs
+                    if etype in CIH_ENTITY_TYPES:
+                        doc_terms[pmid].add(_norm(term))
+                    entities.append(_make_record(pmid, term, etype))
+    return doc_terms, entities, doc_texts
 
 
-def load_dataset(path: str) -> List[DocRecord]:
-    """Auto-detect format by file extension (.json → BioC, .txt → BC5CDR)."""
+def load_bioc_json(path: str) -> Tuple[Dict[str, Set[str]], List[dict], Dict[str, str]]:
+    """
+    BioC-JSON (BioRED) or CIHRED sentence-list format.
+    Returns doc_terms, entities, and doc_texts {doc_id: full_text_lowercased}.
+    """
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    doc_terms: Dict[str, Set[str]] = {}
+    doc_texts: Dict[str, str] = {}
+    entities:  List[dict] = []
+
+    # --- BioRED: {"documents": [...]} ---
+    if isinstance(data, dict):
+        for doc in data.get("documents", []):
+            doc_id = str(doc.get("id", "")).strip()
+            doc_terms.setdefault(doc_id, set())
+            doc_texts[doc_id] = ""
+            for passage in doc.get("passages", []):
+                doc_texts[doc_id] += " " + (passage.get("text", "") or "").lower()
+                for ann in passage.get("annotations", []):
+                    term  = ann.get("text", "").strip()
+                    etype = ""
+                    infons = ann.get("infons", {})
+                    if isinstance(infons, dict):
+                        etype = str(infons.get("type", "")).strip()
+                    if term:
+                        if etype in CIH_ENTITY_TYPES:
+                            doc_terms[doc_id].add(_norm(term))
+                        entities.append(_make_record(doc_id, term, etype))
+
+    # --- CIHRED: [{doc_id, entities:[{text, type}]}, ...] ---
+    elif isinstance(data, list):
+        for record in data:
+            if "doc_id" in record:
+                doc_id = str(record["doc_id"]).strip()
+                doc_terms.setdefault(doc_id, set())
+                doc_texts[doc_id] = doc_texts.get(doc_id, "") + " " + (record.get("text", "") or "").lower()
+                for e in record.get("entities", []):
+                    term  = e.get("text", "").strip()
+                    etype = e.get("type", "").strip()
+                    if term:
+                        if etype in CIH_ENTITY_TYPES:
+                            doc_terms[doc_id].add(_norm(term))
+                        entities.append(_make_record(doc_id, term, etype))
+            else:
+                doc_id = str(record.get("id", record.get("pmid", ""))).strip()
+                doc_terms.setdefault(doc_id, set())
+                doc_texts[doc_id] = ""
+                for passage in record.get("passages", []):
+                    doc_texts[doc_id] += " " + (passage.get("text", "") or "").lower()
+                    for ann in passage.get("annotations", []):
+                        term  = ann.get("text", "").strip()
+                        etype = ""
+                        infons = ann.get("infons", {})
+                        if isinstance(infons, dict):
+                            etype = str(infons.get("type", "")).strip()
+                        if term and etype in CIH_ENTITY_TYPES:
+                            doc_terms[doc_id].add(_norm(term))
+                            entities.append(_make_record(doc_id, term, etype))
+
+    return doc_terms, entities, doc_texts
+
+
+def load_dataset(path: str) -> Tuple[Dict[str, Set[str]], List[dict], Dict[str, str]]:
+    """Auto-detect format by extension."""
     ext = os.path.splitext(path.lower())[1]
     if ext == ".json":
         return load_bioc_json(path)
@@ -153,593 +231,372 @@ def load_dataset(path: str) -> List[DocRecord]:
 
 
 # ===========================================================================
-# 3.  CIH LEXICON / MAPPING LOADER
+# 5.  MATCHING  (from calculate_coverage2.py)
+#     Match per entity category, track which concept each match belongs to.
 # ===========================================================================
 
-def load_cih_mapping(path: str) -> Dict[str, List[str]]:
+def match_entities_to_cih(
+    entities: List[dict],
+    mapping: Dict[str, List[str]],
+    cutoff: float = 0.86,
+) -> Tuple[Set[str], Dict[str, Set[str]], Dict[str, Set[str]]]:
     """
-    Load the CIH lexicon JSON.
-
-    Accepted formats:
-      { concept: [variant, ...] }
-      { category: { variant_key: { "term": "...", ... }, ... }, ... }
-    Returns: { concept: [variant_str, ...] }
-    """
-    with open(path, "r", encoding="utf-8") as fh:
-        raw = json.load(fh)
-
-    mapping: Dict[str, List[str]] = {}
-    for concept, sub in raw.items():
-        variants: List[str] = []
-        if isinstance(sub, list):
-            variants = [v for v in sub if isinstance(v, str) and v.strip()]
-        elif isinstance(sub, dict):
-            for vkey, meta in sub.items():
-                if isinstance(meta, dict) and isinstance(meta.get("term"), str):
-                    t = meta["term"].strip()
-                    if t:
-                        variants.append(t)
-                elif isinstance(vkey, str) and vkey.strip():
-                    variants.append(vkey.strip())
-        if variants:
-            mapping[concept] = sorted(set(variants))
-    return mapping
-
-
-# ===========================================================================
-# 4.  VARIANT EXPANSION & REGEX INDEX
-# ===========================================================================
-
-def _expand_variant(variant: str) -> List[str]:
-    """
-    Generate surface-form expansions for a CIH variant string.
-    Covers hyphenation, slash, plural, and a few domain expansions
-    (electroacupuncture → acupuncture, LLLT → light therapy, etc.).
-    """
-    v = variant.strip()
-    forms = {v}
-    base = re.sub(r"[-/]", " ", v).strip()
-    forms.update({base, re.sub(r"\s+", " ", base), base.replace(" ", "")})
-
-    if base.endswith(" therapy"):
-        forms.add(base[:-8].strip())
-    else:
-        forms.add(base + " therapy")
-    if not base.endswith("s"):
-        forms.add(base + "s")
-
-    nb = base.lower()
-    if "electroacupuncture" in nb or "electro acupuncture" in nb:
-        forms.add("acupuncture")
-    if any(k in nb for k in ("photobiomodulation", "low level laser", "lllt")):
-        forms.update({"light therapy", "phototherapy"})
-
-    return sorted({normalize(f) for f in forms if f.strip()})
-
-
-def _make_regex(norm_variant: str) -> re.Pattern:
-    parts = norm_variant.split()
-    if not parts:
-        return re.compile(r"$^")
-    pattern = r"\b" + r"\s+".join(map(re.escape, parts)) + r"\b"
-    return re.compile(pattern, re.IGNORECASE)
-
-
-def build_variant_index(
-    mapping: Dict[str, List[str]]
-) -> Tuple[List, Dict[str, re.Pattern], Dict[str, List[Tuple[str, str]]]]:
-    """
-    Build lookup structures for fast coverage computation.
+    For each CIH-type annotation term, find the best matching CIH concept
+    using difflib.get_close_matches, grouped by entity type category.
 
     Returns
     -------
-    flat      : [(concept, raw_variant, norm_variant), ...]
-    vregex    : {norm_variant: compiled_regex}
-    v2owners  : {norm_variant: [(concept, raw_variant), ...]}
+    matched_terms       : set of normalised annotation spans that matched
+    concepts_hit        : {entity_type: set(concept_names matched)}
+    matched_by_cat      : {entity_type: set(matched_term_strings)}
     """
-    flat: List[Tuple[str, str, str]] = []
-    v2owners: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    # Group unique terms by entity type
+    by_type: Dict[str, Set[str]] = defaultdict(set)
+    for e in entities:
+        by_type[e["type"]].add(e["text"])
 
+    # Build flat concept->variants bank
+    # all_variants: [(norm_variant, concept_name), ...]
+    all_variants: List[Tuple[str, str]] = []
     for concept, variants in mapping.items():
         for v in variants:
-            for expanded in _expand_variant(v):
-                flat.append((concept, v, expanded))
-                v2owners[expanded].append((concept, v))
+            all_variants.append((v, concept))
+    bank_strings = [b[0] for b in all_variants]
 
-    vregex = {vn: _make_regex(vn) for vn in v2owners}
-    return flat, vregex, v2owners
+    matched_terms: Set[str] = set()
+    concepts_hit: Dict[str, Set[str]] = defaultdict(set)
+    matched_by_cat: Dict[str, Set[str]] = defaultdict(set)
 
+    for etype, terms in by_type.items():
+        for term in terms:
+            best = difflib.get_close_matches(term, bank_strings, n=1, cutoff=cutoff)
+            if best:
+                idx = bank_strings.index(best[0])
+                concept_name = all_variants[idx][1]
+                matched_terms.add(term)
+                concepts_hit[etype].add(concept_name)
+                matched_by_cat[etype].add(term)
 
-# ===========================================================================
-# 5.  FUZZY / HYBRID MATCHING
-# ===========================================================================
-
-def _fuzzy_ratio(a: str, b: str) -> float:
-    if _HAS_RAPIDFUZZ:
-        return _fuzz.token_set_ratio(a, b) / 100.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def _jaccard(a: str, b: str) -> float:
-    A, B = set(a.split()), set(b.split())
-    if not A and not B:
-        return 1.0
-    if not A or not B:
-        return 0.0
-    return len(A & B) / len(A | B)
-
-
-def _hybrid_score(a: str, b: str, alpha: float = 0.70) -> float:
-    return alpha * _fuzzy_ratio(a, b) + (1 - alpha) * _jaccard(a, b)
-
-
-def _token_subset_ratio(a_norm: str, b_norm: str) -> float:
-    A, B = set(a_norm.split()), set(b_norm.split())
-    if not A or not B:
-        return 0.0
-    return len(A & B) / min(len(A), len(B))
-
-
-def match_term_to_cih(
-    term: str,
-    flat: List,
-    alpha: float = 0.70,
-    threshold: float = 0.65,
-    jaccard_floor: float = 0.30,
-) -> Tuple[bool, Optional[str], Optional[str], float]:
-    """
-    Three-stage cascade matcher:
-      1. Exact normalised match
-      2. Substring / token-subset match (≥0.80)
-      3. Hybrid fuzzy + Jaccard score (≥ threshold & jaccard_floor)
-
-    Returns (matched, concept, raw_variant, score).
-    """
-    tnorm = normalize(term)
-
-    # Stage 1: exact
-    for concept, v_raw, v_norm in flat:
-        if tnorm == v_norm:
-            return True, concept, v_raw, 1.0
-
-    # Stage 2: substring / token subset
-    for concept, v_raw, v_norm in flat:
-        if v_norm in tnorm or tnorm in v_norm or _token_subset_ratio(tnorm, v_norm) >= 0.80:
-            return True, concept, v_raw, 0.95
-
-    # Stage 3: fuzzy hybrid
-    best_score, best_concept, best_v_raw, best_jaccard = -1.0, None, None, 0.0
-    for concept, v_raw, v_norm in flat:
-        score = _hybrid_score(tnorm, v_norm, alpha=alpha)
-        jac   = _jaccard(tnorm, v_norm) if (" " in tnorm or " " in v_norm) else 1.0
-        if score > best_score:
-            best_score, best_concept, best_v_raw, best_jaccard = score, concept, v_raw, jac
-
-    j_floor = jaccard_floor if (" " in tnorm or " " in (best_v_raw or "")) else 0.0
-    if best_score >= threshold and best_jaccard >= j_floor:
-        return True, best_concept, best_v_raw, best_score
-
-    return False, None, None, best_score
+    return matched_terms, dict(concepts_hit), dict(matched_by_cat)
 
 
 # ===========================================================================
-# 6.  COVERAGE METRICS
+# 6.  COMPUTE ALL SIX TABLE COLUMNS
 # ===========================================================================
 
-def compute_free_text_coverage(
-    docs: List[DocRecord],
-    vregex: Dict[str, re.Pattern],
-    v2owners: Dict[str, List[Tuple[str, str]]],
-) -> Tuple[Counter, Counter, int, float, Counter]:
+def _flat_fuzzy_match(all_terms: Set[str], cih_terms_flat: List[str], cutoff: float) -> Set[str]:
     """
-    Scan free text of each document for CIH variant regex hits.
-
-    Returns
-    -------
-    concept_hits  : Counter {concept: total_regex_hits}
-    variant_hits  : Counter {norm_variant: total_regex_hits}
-    docs_with_hit : int
-    doc_coverage_pct : float
-    doc_hits      : Counter {pmid: total_hits_in_doc}
+    Original logic from calculate_coverage_biored.py:
+    Pool ALL annotation spans globally, run flat difflib match against all
+    CIH variant strings. No per-category grouping, no concept tracking.
+    Used for BC5CDR and BioRED.
     """
-    concept_hits: Counter = Counter()
-    variant_hits: Counter = Counter()
-    doc_hits:     Counter = Counter()
-    docs_with_hit = 0
-
-    for doc in docs:
-        doc_norm = normalize(doc["text"])
-        any_hit = False
-        for v_norm, rgx in vregex.items():
-            n = len(rgx.findall(doc_norm))
-            if n > 0:
-                variant_hits[v_norm] += n
-                any_hit = True
-                for concept, _ in v2owners[v_norm]:
-                    concept_hits[concept] += n
-                doc_hits[doc["pmid"]] += n
-        if any_hit:
-            docs_with_hit += 1
-
-    total = len(docs)
-    doc_cov_pct = 100.0 * docs_with_hit / total if total else 0.0
-    return concept_hits, variant_hits, docs_with_hit, doc_cov_pct, doc_hits
+    matched: Set[str] = set()
+    for term in all_terms:
+        if difflib.get_close_matches(term, cih_terms_flat, n=1, cutoff=cutoff):
+            matched.add(term)
+    return matched
 
 
-def compute_ner_term_coverage(
-    docs: List[DocRecord],
-    flat: List,
-    alpha: float = 0.70,
-    threshold: float = 0.65,
-    jaccard_floor: float = 0.30,
-) -> Tuple[float, int, int, List[Dict], Counter]:
+def compute_coverage(
+    doc_terms: Dict[str, Set[str]],
+    entities: List[dict],
+    mapping: Dict[str, List[str]],
+    doc_texts: Optional[Dict[str, str]] = None,
+    cutoff: float = 0.86,
+    docs_with_cih_by_presence: bool = False,
+    use_original_flat_match: bool = False,
+) -> dict:
     """
-    Map each unique gold-annotated entity span to the CIH lexicon.
+    Compute all six columns for Table 4.
 
-    Returns
-    -------
-    coverage_pct   : float
-    matched        : int
-    total_unique   : int
-    term_rows      : list of dicts (for CSV export)
-    concept_hits   : Counter
+    doc_terms  : {doc_id: set(CIH-type annotation spans)} — for CIHRED presence count
+    entities   : [{doc_id, text(normed), type}]           — ALL entity types loaded
+    mapping    : {concept: [variants]}                    — CIH lexicon
+    doc_texts  : {doc_id: full_text_lowercased}           — for BC5CDR/BioRED full-text scan
+
+    docs_with_cih_by_presence:
+        True  → Docs with CIH = docs that have any CIH-type entity annotation (CIHRED)
+        False → Docs with CIH = docs where full text contains a CIH lexicon variant
+
+    use_original_flat_match:
+        True  → BC5CDR / BioRED:
+                  - Docs with CIH + Covered Concepts = full-text substring scan
+                    (case-insensitive match of every CIH variant against raw doc text)
+                  - Unique Ann. Terms / Annotated CIH Terms = CIH-type spans only
+        False → CIHRED:
+                  - Per entity-type category matching, tracks concept names hit
     """
-    unique_terms: Dict[str, str] = {}
-    for doc in docs:
-        for term, _ in doc["entities"]:
-            key = normalize(term)
-            if key and key not in unique_terms:
-                unique_terms[key] = term
+    total_docs = len(doc_terms)
 
-    matched = 0
-    concept_hits: Counter = Counter()
-    term_rows: List[Dict] = []
+    # ── Three annotation columns (both paths) ────────────────────────────────
+    # unique_ann_terms     : unique spans of ALL entity types (Chemical, Disease, CIH…)
+    # unique_ann_cih_terms : unique spans of CIH-type entities only (deduplicated)
+    # total_ann_cih_terms  : total CIH-type spans including duplicates across all docs
+    cih_entities = [e for e in entities if e["type"] in CIH_ENTITY_TYPES]
+    unique_ann_terms:     Set[str] = set(e["text"] for e in entities)
+    unique_ann_cih_terms: Set[str] = set(e["text"] for e in cih_entities)
+    total_ann_cih_terms:  int      = len(cih_entities)
 
-    for term in unique_terms.values():
-        ok, concept, variant, score = match_term_to_cih(
-            term, flat, alpha=alpha, threshold=threshold, jaccard_floor=jaccard_floor
-        )
-        term_rows.append({
-            "term":    term,
-            "matched": "yes" if ok else "no",
-            "concept": concept or "",
-            "variant": variant or "",
-            "score":   f"{score:.3f}",
-        })
-        if ok and concept:
-            matched += 1
-            concept_hits[concept] += 1
+    if use_original_flat_match:
+        # ── BC5CDR / BioRED: full-text substring scan ─────────────────────────
+        # For each doc, check if any CIH lexicon variant appears in the raw text
+        cih_terms_flat: List[str] = [v for variants in mapping.values() for v in variants]
+        # Build concept lookup: variant → concept name
+        variant_to_concept: Dict[str, str] = {
+            v: concept
+            for concept, variants in mapping.items()
+            for v in variants
+        }
 
-    total = len(unique_terms)
-    coverage_pct = round(100.0 * matched / total, 2) if total else 0.0
-    return coverage_pct, matched, total, term_rows, concept_hits
+        docs_with_cih    = 0
+        covered_concepts: Set[str] = set()
 
+        texts = doc_texts or {}
+        for doc_id, text in texts.items():
+            norm_text = _norm(text)
+            for variant in cih_terms_flat:
+                if variant in norm_text:
+                    docs_with_cih += 1
+                    covered_concepts.add(variant_to_concept[variant])
+                    break   # only need one hit to count the doc; keep scanning for concepts
 
-def compute_concept_coverage(
-    concept_hits: Counter, mapping: Dict[str, List[str]]
-) -> Tuple[float, int]:
-    """Return (concept_coverage_pct, n_covered_concepts)."""
-    covered = sum(1 for c in mapping if concept_hits.get(c, 0) > 0)
-    pct = 100.0 * covered / len(mapping) if mapping else 0.0
-    return round(pct, 2), covered
+        # Second pass to get ALL covered concepts across all docs
+        covered_concepts = set()
+        for doc_id, text in texts.items():
+            norm_text = _norm(text)
+            for variant in cih_terms_flat:
+                if variant in norm_text:
+                    covered_concepts.add(variant_to_concept[variant])
 
+        total_concepts = len(mapping)
+        concept_coverage_pct = round(
+            100.0 * len(covered_concepts) / total_concepts, 2
+        ) if total_concepts else 0.0
 
-# ===========================================================================
-# 7.  OUTPUT WRITERS
-# ===========================================================================
-
-_SUMMARY_FIELDS = [
-    "total_docs", "docs_with_cih", "doc_coverage_pct",
-    "total_concepts", "covered_concepts", "concept_coverage_pct",
-    "ner_total_unique_terms", "ner_matched_terms", "ner_term_coverage_pct",
-    "alpha", "threshold", "jaccard_floor",
-]
-
-
-def write_summary_csv(
-    path: str,
-    *,
-    total_docs: int,
-    docs_with_hit: int,
-    doc_cov_pct: float,
-    total_concepts: int,
-    covered_concepts: int,
-    concept_cov_pct: float,
-    ner_total: object = "",
-    ner_matched: object = "",
-    ner_pct: object = "",
-    alpha: float,
-    threshold: float,
-    jaccard_floor: float,
-) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_SUMMARY_FIELDS)
-        writer.writeheader()
-        writer.writerow({
+        return {
             "total_docs":              total_docs,
-            "docs_with_cih":           docs_with_hit,
-            "doc_coverage_pct":        round(doc_cov_pct, 2),
-            "total_concepts":          total_concepts,
-            "covered_concepts":        covered_concepts,
-            "concept_coverage_pct":    round(concept_cov_pct, 2),
-            "ner_total_unique_terms":  ner_total,
-            "ner_matched_terms":       ner_matched,
-            "ner_term_coverage_pct":   ner_pct,
-            "alpha":                   alpha,
-            "threshold":               threshold,
-            "jaccard_floor":           jaccard_floor,
-        })
+            "docs_with_cih":           docs_with_cih,
+            "covered_cih_concepts":    len(covered_concepts),
+            "concept_coverage_pct":    concept_coverage_pct,
+            "unique_annotation_terms":     len(unique_ann_terms),
+            "unique_ann_cih_terms":        len(unique_ann_cih_terms),
+            "annotated_cih_terms":         total_ann_cih_terms,
+        }
 
-
-def _write_counter_csv(path: str, counter: Counter, col1: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow([col1, "count"])
-        writer.writerows(counter.most_common())
-
-
-def write_threshold_sweep(
-    path: str,
-    all_docs: List[DocRecord],
-    flat: List,
-    thresholds: List[float],
-    alpha: float,
-    jaccard_floor: float,
-) -> None:
-    """Write a CSV showing NER term coverage at several threshold values."""
-    unique_terms: Dict[str, str] = {}
-    for doc in all_docs:
-        for term, _ in doc["entities"]:
-            key = normalize(term)
-            if key and key not in unique_terms:
-                unique_terms[key] = term
-
-    rows = []
-    for th in thresholds:
-        matched = sum(
-            1 for t in unique_terms.values()
-            if match_term_to_cih(t, flat, alpha=alpha, threshold=th, jaccard_floor=jaccard_floor)[0]
+    else:
+        # ── CIHRED: per entity-type category matching, tracks concept names ───
+        matched_terms, concepts_hit_by_cat, _ = match_entities_to_cih(
+            cih_entities, mapping, cutoff=cutoff
         )
-        cov = round(100.0 * matched / len(unique_terms), 2) if unique_terms else 0.0
-        rows.append({
-            "threshold":         th,
-            "term_coverage_pct": cov,
-            "matched_terms":     matched,
-            "total_terms":       len(unique_terms),
-        })
 
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(
-            fh, fieldnames=["threshold", "term_coverage_pct", "matched_terms", "total_terms"]
-        )
-        writer.writeheader()
-        writer.writerows(rows)
+        if docs_with_cih_by_presence:
+            docs_with_cih = sum(1 for terms in doc_terms.values() if terms)
+        else:
+            docs_with_cih = sum(
+                1 for terms in doc_terms.values()
+                if terms & matched_terms
+            )
+
+        all_concepts_hit: Set[str] = set()
+        for concepts in concepts_hit_by_cat.values():
+            all_concepts_hit.update(concepts)
+
+        total_concepts = len(mapping)
+        concept_coverage_pct = round(
+            100.0 * len(all_concepts_hit) / total_concepts, 2
+        ) if total_concepts else 0.0
+
+        return {
+            "total_docs":              total_docs,
+            "docs_with_cih":           docs_with_cih,
+            "covered_cih_concepts":    len(all_concepts_hit),
+            "concept_coverage_pct":    concept_coverage_pct,
+            "unique_annotation_terms":     len(unique_ann_terms),
+            "unique_ann_cih_terms":        len(unique_ann_cih_terms),
+            "annotated_cih_terms":         total_ann_cih_terms,
+        }
 
 
 # ===========================================================================
-# 8.  MAIN ENTRY POINT
+# 7.  ARG PARSER
 # ===========================================================================
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="calculate_cih_coverage",
         description=(
-            "Compute CIH lexicon coverage over biomedical NER datasets.\n\n"
-            "Accepts BC5CDR PubTator (.txt) and/or BioRED / BioC-JSON (.json) files.\n"
-            "Outputs per-file and combined summary CSVs plus optional detail tables."
+            "Reproduce Table 4: CIH concept coverage across datasets.\n\n"
+            "Only CIH entity types are matched (Energy_therapy, Manual_bodybased_therapy,\n"
+            "Mindbody_therapy, CIH_intervention, Usual_Medical_Care).\n"
+            "Matching: difflib.get_close_matches per category, cutoff=0.86.\n\n"
+            "Use --dataset NAME FILE [FILE ...] to group splits under one label."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples
 --------
-# BioRED (train + dev + test)
+# Reproduce all three rows of Table 4:
 python calculate_cih_coverage.py \\
-    --infile BioRED/Train.BioC.JSON BioRED/Dev.BioC.JSON BioRED/Test.BioC.JSON \\
+    --dataset BC5CDR  CDR_Data/CDR_TrainingSet.PubTator.txt CDR_Data/TestSet.tmChem.PubTator.txt CDR_DevelopmentSet.PubTator.txt \\
+    --dataset BioRED  BioRED/Train.BioC.JSON BioRED/Dev.BioC.JSON BioRED/Test.BioC.JSON \\
+    --dataset CIHRED  CIHRED/train.json CIHRED/valid.json CIHRED/test.json \\
     --mapping_json 2023cihlex_manual_filter_mapping.json \\
-    --out_dir results/biored --map_ner
-
-# BC5CDR corpus
-python calculate_cih_coverage.py \\
-    --infile CDR_TrainingSet.PubTator.txt TestSet.tmChem.PubTator.txt \\
-    --mapping_json 2023cihlex_manual_filter_mapping.json \\
-    --out_dir results/bc5cdr --map_ner --sweep
-
-# Mixed input (auto-detected by extension)
-python calculate_cih_coverage.py \\
-    --infile Train.BioC.JSON CDR_TrainingSet.PubTator.txt \\
-    --mapping_json 2023cihlex_manual_filter_mapping.json \\
-    --out_dir results/mixed
+    --out_dir results
         """,
     )
-
-    # --- Input ---
     inp = parser.add_argument_group("Input")
     inp.add_argument(
-        "--infile", nargs="+", metavar="FILE",
-        help="One or more input files (.txt for BC5CDR, .json for BioC/BioRED). "
-             "Format is auto-detected by extension.",
+        "--dataset", nargs="+", action="append", metavar="NAME_OR_FILE",
+        help="First token = dataset name; rest = file paths. Repeat for each dataset.",
     )
     inp.add_argument(
         "--mapping_json", default="2023cihlex_manual_filter_mapping.json", metavar="JSON",
-        help="Path to CIH lexicon/mapping JSON. (default: %(default)s)",
+        help="CIH lexicon JSON (https://github.com/zhang-informatics/CIH). (default: %(default)s)",
     )
-
-    # --- Output ---
     out = parser.add_argument_group("Output")
     out.add_argument(
         "--out_dir", default="cih_coverage_results", metavar="DIR",
-        help="Directory to write output CSV files. Created if absent. (default: %(default)s)",
+        help="Output directory. Created if absent. (default: %(default)s)",
     )
-
-    # --- Matching ---
-    match = parser.add_argument_group("Matching parameters")
+    match = parser.add_argument_group("Matching")
     match.add_argument(
-        "--alpha", type=float, default=0.70, metavar="FLOAT",
-        help="Weight for fuzzy ratio vs Jaccard in hybrid score. (default: %(default)s)",
+        "--cutoff", type=float, default=0.86, metavar="FLOAT",
+        help="difflib cutoff (default: %(default)s, matching calculate_coverage2.py)",
     )
     match.add_argument(
-        "--threshold", type=float, default=0.65, metavar="FLOAT",
-        help="Minimum hybrid score to count as a match. (default: %(default)s)",
+        "--presence_datasets", nargs="*", default=["CIHRED"], metavar="NAME",
+        help=(
+            "Dataset names where 'Docs with CIH' is counted by CIH entity presence "
+            "rather than lexicon match. Use for corpora explicitly selected to contain "
+            "CIH (e.g. CIHRED). (default: CIHRED)"
+        ),
     )
-    match.add_argument(
-        "--jaccard_floor", type=float, default=0.30, metavar="FLOAT",
-        help="Minimum Jaccard similarity required alongside threshold. (default: %(default)s)",
-    )
-
-    # --- Optional outputs ---
-    opt = parser.add_argument_group("Optional outputs")
-    opt.add_argument(
-        "--map_ner", action="store_true",
-        help="Map gold NER spans to CIH concepts and write per-file + combined CSV.",
-    )
-    opt.add_argument(
-        "--sweep", action="store_true",
-        help="Write sweep.csv showing NER term coverage across multiple thresholds.",
-    )
-
     return parser
 
 
-def process_files(
-    input_paths: List[str],
-    mapping: Dict[str, List[str]],
-    flat: List,
-    vregex: Dict,
-    v2owners: Dict,
-    out_dir: str,
-    args: argparse.Namespace,
-) -> List[DocRecord]:
-    """Run per-file coverage and write summary CSVs. Returns all docs combined."""
-    all_docs: List[DocRecord] = []
-
-    for fp in input_paths:
-        print(f"  Loading: {fp}")
-        docs = load_dataset(fp)
-        all_docs.extend(docs)
-
-        ch, vh, dwh, dcp, dh = compute_free_text_coverage(docs, vregex, v2owners)
-        concept_cov_pct, covered = compute_concept_coverage(ch, mapping)
-
-        ner_pct = ner_matched = ner_total = ""
-        if args.map_ner:
-            ner_pct, ner_matched, ner_total, term_rows, _ = compute_ner_term_coverage(
-                docs, flat,
-                alpha=args.alpha, threshold=args.threshold, jaccard_floor=args.jaccard_floor,
-            )
-            base = os.path.splitext(os.path.basename(fp))[0]
-            ner_path = os.path.join(out_dir, f"ner_terms__{base}.csv")
-            with open(ner_path, "w", newline="", encoding="utf-8") as fh:
-                writer = csv.DictWriter(fh, fieldnames=["term", "matched", "concept", "variant", "score"])
-                writer.writeheader()
-                writer.writerows(term_rows)
-            print(f"    → NER mapping written: {ner_path}")
-
-        base = os.path.splitext(os.path.basename(fp))[0]
-        summary_path = os.path.join(out_dir, f"summary__{base}.csv")
-        write_summary_csv(
-            summary_path,
-            total_docs=len(docs), docs_with_hit=dwh, doc_cov_pct=dcp,
-            total_concepts=len(mapping), covered_concepts=covered, concept_cov_pct=concept_cov_pct,
-            ner_total=ner_total, ner_matched=ner_matched, ner_pct=ner_pct,
-            alpha=args.alpha, threshold=args.threshold, jaccard_floor=args.jaccard_floor,
-        )
-        print(
-            f"    docs={len(docs)}  doc_cov={dcp:.1f}%  "
-            f"concept_cov={concept_cov_pct:.1f}%"
-            + (f"  ner_cov={ner_pct:.1f}%" if args.map_ner else "")
-        )
-
-    return all_docs
-
+# ===========================================================================
+# 8.  MAIN
+# ===========================================================================
 
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # --- Validate inputs ---
-    if not args.infile:
-        parser.error("No input files provided. Use --infile FILE [FILE ...]")
-
-    missing = [p for p in args.infile if not os.path.isfile(p)]
-    if missing:
-        parser.error(f"Files not found: {', '.join(missing)}")
-
+    if not args.dataset:
+        parser.error("No datasets provided. Example: --dataset CIHRED train.json valid.json test.json")
     if not os.path.isfile(args.mapping_json):
         parser.error(f"CIH mapping JSON not found: {args.mapping_json}")
 
-    # De-duplicate while preserving order
-    seen: set = set()
-    input_paths: List[str] = []
-    for p in args.infile:
-        if p not in seen:
-            seen.add(p); input_paths.append(p)
+    dataset_groups: List[Tuple[str, List[str]]] = []
+    for group in args.dataset:
+        if len(group) < 2:
+            parser.error(f"--dataset needs a name and at least one file. Got: {group}")
+        name, *files = group
+        missing = [f for f in files if not os.path.isfile(f)]
+        if missing:
+            parser.error(f"Files not found for '{name}': {', '.join(missing)}")
+        dataset_groups.append((name, files))
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # --- Load lexicon ---
     print(f"Loading CIH mapping: {args.mapping_json}")
     mapping = load_cih_mapping(args.mapping_json)
-    flat, vregex, v2owners = build_variant_index(mapping)
-    print(f"  {len(mapping)} concepts | {len(vregex)} expanded variants\n")
+    print(f"  {len(mapping)} CIH concepts loaded\n")
 
-    # --- Per-file ---
-    print("Processing files...")
-    all_docs = process_files(input_paths, mapping, flat, vregex, v2owners, args.out_dir, args)
+    summary_rows: List[dict] = []
 
-    # --- Combined ---
-    print("\nComputing combined coverage...")
-    ch, vh, dwh, dcp, dh = compute_free_text_coverage(all_docs, vregex, v2owners)
-    concept_cov_pct, covered = compute_concept_coverage(ch, mapping)
+    for dataset_name, file_paths in dataset_groups:
+        print(f"[{dataset_name}]  pooling {len(file_paths)} split(s)...")
 
-    combined_summary = os.path.join(args.out_dir, "summary__combined.csv")
-    write_summary_csv(
-        combined_summary,
-        total_docs=len(all_docs), docs_with_hit=dwh, doc_cov_pct=dcp,
-        total_concepts=len(mapping), covered_concepts=covered, concept_cov_pct=concept_cov_pct,
-        alpha=args.alpha, threshold=args.threshold, jaccard_floor=args.jaccard_floor,
-    )
+        pooled_doc_terms: Dict[str, Set[str]] = {}
+        pooled_entities: List[dict] = []
+        pooled_doc_texts: Dict[str, str] = {}
 
-    _write_counter_csv(os.path.join(args.out_dir, "concept_hits.csv"),  ch, "concept")
-    _write_counter_csv(os.path.join(args.out_dir, "variant_hits.csv"),  vh, "variant_norm")
-    _write_counter_csv(os.path.join(args.out_dir, "doc_hits.csv"),       dh, "pmid")
+        for fp in file_paths:
+            dt, ents, texts = load_dataset(fp)
+            print(f"  {os.path.basename(fp):45s}  {len(dt):>5,} docs  {len(ents):>6,} CIH entities")
+            pooled_doc_terms.update(dt)
+            pooled_entities.extend(ents)
+            for doc_id, text in texts.items():
+                pooled_doc_texts[doc_id] = pooled_doc_texts.get(doc_id, "") + " " + text
 
-    print(
-        f"  Combined: docs={len(all_docs)}  doc_cov={dcp:.1f}%  "
-        f"concept_cov={concept_cov_pct:.1f}%"
-    )
+        print(f"  {'Pooled:':45s}  {len(pooled_doc_terms):>5,} docs  {len(pooled_entities):>6,} CIH entities")
 
-    # --- Optional: NER term mapping (combined) ---
-    if args.map_ner:
-        ner_pct, ner_matched, ner_total, term_rows, _ = compute_ner_term_coverage(
-            all_docs, flat,
-            alpha=args.alpha, threshold=args.threshold, jaccard_floor=args.jaccard_floor,
+        by_presence  = dataset_name in args.presence_datasets
+        flat_match   = dataset_name not in args.presence_datasets
+        metrics = compute_coverage(
+            pooled_doc_terms, pooled_entities, mapping,
+            doc_texts=pooled_doc_texts,
+            cutoff=args.cutoff,
+            docs_with_cih_by_presence=by_presence,
+            use_original_flat_match=flat_match,
         )
-        ner_combined = os.path.join(args.out_dir, "ner_terms__combined.csv")
-        with open(ner_combined, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["term", "matched", "concept", "variant", "score"])
-            writer.writeheader()
-            writer.writerows(term_rows)
-        print(f"  NER term coverage: {ner_matched}/{ner_total} ({ner_pct:.1f}%)")
 
-    # --- Optional: threshold sweep ---
-    if args.sweep:
-        sweep_path = os.path.join(args.out_dir, "sweep.csv")
-        write_threshold_sweep(
-            sweep_path, all_docs, flat,
-            thresholds=[0.55, 0.60, 0.65, 0.68, 0.70, 0.75, 0.80],
-            alpha=args.alpha, jaccard_floor=args.jaccard_floor,
+        print(
+            f"  Docs with CIH         : {metrics['docs_with_cih']} / {metrics['total_docs']}\n"
+            f"  Covered concepts      : {metrics['covered_cih_concepts']} / {len(mapping)} "
+            f"({metrics['concept_coverage_pct']:.2f}%)\n"
+            f"  Unique Ann.           : {metrics['unique_annotation_terms']}  "
+            f"(all entity types, deduplicated)\n"
+            f"  Unique Ann. CIH Terms : {metrics['unique_ann_cih_terms']}  "
+            f"(CIH-type spans, deduplicated)\n"
+            f"  Ann. CIH Terms        : {metrics['annotated_cih_terms']}  "
+            f"(all CIH-type spans incl. duplicates)\n"
         )
-        print(f"  Threshold sweep written: {sweep_path}")
 
-    # --- Summary ---
-    print(f"\nDone. Results written to: {args.out_dir}/")
-    print("  summary__combined.csv")
-    print("  summary__<file>.csv   (one per input)")
-    print("  concept_hits.csv, variant_hits.csv, doc_hits.csv")
-    if args.map_ner:
-        print("  ner_terms__<file>.csv, ner_terms__combined.csv")
-    if args.sweep:
-        print("  sweep.csv")
+        # Report any docs that have no CIH-type entities
+        no_cih_docs = [doc_id for doc_id, terms in pooled_doc_terms.items() if not terms]
+        # if no_cih_docs:
+        #     print(f"  ⚠️  {len(no_cih_docs)} doc(s) with NO CIH-type entities:")
+        #     for doc_id in sorted(no_cih_docs):
+        #         print(f"      - {doc_id}")
+        #     print()
+
+        # Per-term detail CSV
+        all_terms: Set[str] = set(e["text"] for e in pooled_entities)
+        matched_terms, _, _ = match_entities_to_cih(pooled_entities, mapping, cutoff=args.cutoff)
+        detail_path = os.path.join(args.out_dir, f"terms__{dataset_name}.csv")
+        with open(detail_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["term", "matched_to_cih"])
+            for term in sorted(all_terms):
+                writer.writerow([term, "yes" if term in matched_terms else "no"])
+
+        summary_rows.append({"dataset": dataset_name, **metrics})
+
+    # Write dataset_summary.csv
+    summary_path = os.path.join(args.out_dir, "dataset_summary.csv")
+    fields = [
+        "dataset", "total_docs", "docs_with_cih",
+        "covered_cih_concepts", "concept_coverage_pct",
+        "unique_annotation_terms", "unique_ann_cih_terms", "annotated_cih_terms",
+    ]
+    with open(summary_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    # Print paper Table 4
+    print("=" * 115)
+    print(f"{'Dataset':<10} {'Total Docs':>11} {'Docs w/ CIH':>12} {'Covered Concepts':>17} "
+          f"{'Concept Cov%':>13} {'Unique Ann.':>12} {'Uniq Ann. CIH':>14} {'Ann. CIH Terms':>15}")
+    print("-" * 115)
+    for r in summary_rows:
+        print(
+            f"{r['dataset']:<10} "
+            f"{r['total_docs']:>11,} "
+            f"{r['docs_with_cih']:>12,} "
+            f"{r['covered_cih_concepts']:>17,} "
+            f"{r['concept_coverage_pct']:>12.2f}% "
+            f"{r['unique_annotation_terms']:>12,} "
+            f"{r['unique_ann_cih_terms']:>14,} "
+            f"{r['annotated_cih_terms']:>15,}"
+        )
+    print("=" * 115)
+    print(f"\nResults written to: {args.out_dir}/")
+    print(f"  dataset_summary.csv      ← Table 4")
+    print(f"  terms__<dataset>.csv     ← per-term match detail")
 
 
 if __name__ == "__main__":
