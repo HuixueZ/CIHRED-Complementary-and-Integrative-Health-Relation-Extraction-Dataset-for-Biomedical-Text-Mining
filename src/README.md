@@ -5,23 +5,6 @@ There are two NER paradigms: **BERT-based token classification** and **LLM-based
 
 ---
 
-## Directory structure expected
-
-```
-.
-├── train.json
-├── valid.json
-├── test.json
-├── embeddings/                         # (optional, for RAG)
-│   ├── similar_ner_doc_train_qwen.npy
-│   ├── similar_ner_doc_test_qwen.npy
-│   ├── similar_doc_train_qwen.npy
-│   └── similar_doc_test_qwen.npy
-└── checkpoints/                        # created automatically
-```
-
----
-
 ## Requirements
 
 ```bash
@@ -118,18 +101,6 @@ python train_ner.py \
     --learning_rate 2e-5
 ```
 
-### With RAG (retrieval-augmented generation)
-
-```bash
-python train_ner.py \
-    --model_id Qwen/Qwen2.5-7B-Instruct \
-    --output_dir /path/to/output/ckp \
-    --rag \
-    --topk 1 \
-    --train_embeddings embeddings/similar_ner_doc_train_qwen.npy \
-    --test_embeddings  embeddings/similar_ner_doc_test_qwen.npy
-```
-
 ### Key arguments
 
 | Argument | Default | Description |
@@ -146,8 +117,6 @@ python train_ner.py \
 | `--save_steps` | `500` | Checkpoint interval |
 | `--lora_r` | `64` | LoRA rank |
 | `--lora_alpha` | `16` | LoRA alpha |
-| `--rag` | off | Enable RAG examples |
-| `--topk` | `1` | Number of RAG examples |
 | `--add_generation` | off | Add synthetic data |
 
 ---
@@ -184,20 +153,6 @@ python inference_ner.py \
     --batch_size 16
 ```
 
-### With RAG
-
-```bash
-python inference_ner.py \
-    --base_model Qwen/Qwen2.5-7B-Instruct \
-    --checkpoint_dir /path/to/ckp \
-    --checkpoint checkpoint-3500 \
-    --test_data test.json \
-    --rag \
-    --topk 1 \
-    --train_data train.json \
-    --embeddings_path embeddings/similar_test_qwen.npy
-```
-
 ### Arguments
 
 | Argument | Default | Description |
@@ -206,11 +161,7 @@ python inference_ner.py \
 | `--checkpoint_dir` | — | Directory containing LoRA checkpoints |
 | `--checkpoint` | — | Specific checkpoint folder name |
 | `--test_data` | `test.json` | Test data |
-| `--train_data` | `train.json` | Train data (RAG only) |
 | `--batch_size` | `16` | Inference batch size |
-| `--rag` | off | Enable RAG |
-| `--topk` | `1` | RAG top-k examples |
-| `--embeddings_path` | `embeddings/similar_test_qwen.npy` | Embeddings for RAG |
 | `--output_dir` | `prediction2` | Output directory |
 | `--output_name` | — | Custom output filename |
 
@@ -275,16 +226,6 @@ python train_re.py \
     --num_train_epochs 20
 ```
 
-### With RAG
-
-```bash
-python train_re.py \
-    --model_id Qwen/Qwen2.5-7B-Instruct \
-    --output_dir /path/to/output/ckp \
-    --rag 1 \
-    --topk 1
-```
-
 ### With synthetic data augmentation
 
 ```bash
@@ -299,9 +240,7 @@ python train_re.py \
 | Argument | Default | Description |
 |---|---|---|
 | `--model_id` | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | Model |
-| `--output_dir` | `re_by_doc_DeepSeek_8b_rag` | Full output path |
-| `--rag` | `0` | Set to `1` to enable RAG |
-| `--topk` | `1` | RAG top-k |
+| `--output_dir` | *(required)* | Full output path |
 | `--num_train_epochs` | `20` | Epochs |
 | `--add_generation` | off | Add synthetic augmentation data |
 
@@ -359,23 +298,3 @@ python inference_re_not_none.py \
     --test_path test.json \
     --output_path results/inference_no_none.jsonl
 ```
-
-Arguments are identical to `inference_re.py`.
-
----
-
-## Bugs fixed (changes from original files)
-
-| File | Bug | Fix |
-|---|---|---|
-| `evaluate_ner.py` | Syntax error: `'Mindbody_therapy',: "..."` (comma after dict key) | Removed stray comma |
-| `inference_ner.py` | `from train_combile_split import add_similar_examples` — module does not exist | Inlined the function |
-| `inference_ner_CIH.py` | Same broken import | Same fix |
-| `ner_train_collapsed_labels.py` | `from overlap_evaluation import detailed_evaluation_with_overlap` — module does not exist | Removed import and orphaned call |
-| `ner_train_collapsed_labels.py` | `model.save_pretrained(save_dir)` was commented out — best model never saved | Un-commented |
-| `train_re.py`, `inference_re.py`, `inference_re_not_none.py` | `OBJECT` list missing comma: `'Outcome_marker' 'chronic_pain'` silently concatenates to one string | Added missing comma |
-| `inference_re.py`, `inference_re_not_none.py` | `print(f"\weighted Metrics:")` — `\w` is a regex escape, not a newline | Fixed to `"Weighted Metrics:"` |
-| `inference_re.py`, `inference_re_not_none.py` | `temperature=0.0` passed when `do_sample=False` — causes HuggingFace warning | Guarded: temperature only passed when `do_sample=True` |
-| `complete_ner_training.py`, `ner_train_collapsed_labels.py` | `DATA_DIR` and `CHECKPOINT_DIR` were hardcoded cluster paths | Replaced with `os.environ.get(...)` + CLI args |
-| `train_ner.py`, `train_ner_CIH.py` | `output_dir` had hardcoded cluster prefix | `args.output_dir` is now used directly as the full path |
-| `train_re.py` | Same hardcoded output prefix + hardcoded CSV path in `add_generation_data` | Both replaced with configurable values |
